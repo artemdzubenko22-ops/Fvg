@@ -1,0 +1,249 @@
+-- worm shadow 🪱 | auto godmode + damage blocker
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local player = Players.LocalPlayer
+local settings = {
+    Godmode = true,
+    BlockTakeDamage = true,
+    RemoveAttacks = true,
+    DisableRemotes = false, -- по умолчанию выкл, чтобы не сломать игру сразу
+}
+
+-- ============================================================
+-- 1. ЗАЩИТА HUMANOD (годмод и хук урона)
+-- ============================================================
+local oldTakeDamage = nil
+
+local function setupHumanoid(char)
+    local hum = char:WaitForChild("Humanoid", 5)
+    if not hum then return end
+
+    -- Годмод (постоянная регенерация)
+    task.spawn(function()
+        while char.Parent and hum.Parent do
+            if settings.Godmode then
+                hum.Health = hum.MaxHealth
+            end
+            task.wait(0.1)
+        end
+    end)
+
+    -- Хук на TakeDamage (если поддерживается)
+    if hookfunction and not oldTakeDamage then
+        local success, err = pcall(function()
+            oldTakeDamage = hookfunction(hum.TakeDamage, function(self, amount)
+                if settings.BlockTakeDamage then
+                    return 0
+                end
+                return oldTakeDamage(self, amount)
+            end)
+        end)
+        if not success then
+            print("[worm shadow] хуки недоступны, используем только регенерацию")
+        end
+    end
+end
+
+if player.Character then
+    setupHumanoid(player.Character)
+end
+player.CharacterAdded:Connect(setupHumanoid)
+
+-- ============================================================
+-- 2. УДАЛЕНИЕ АТАК (визуал)
+-- ============================================================
+local attackKeywords = {
+    "attack", "projectile", "bone", "blaster", "beam", "spike", "wave", 
+    "slash", "hitbox", "bullet", "laser", "orb", "shockwave", "damage"
+}
+local attackFolders = {"attacks", "effects", "projectiles", "vfx", "hitbox"}
+
+local function isAttack(obj)
+    if not obj then return false end
+    if not obj:IsA("BasePart") and not obj:IsA("Model") then return false end
+    local parent = obj.Parent
+    if parent and table.find(attackFolders, string.lower(parent.Name)) then
+        return true
+    end
+    local name = string.lower(obj.Name)
+    for _, kw in ipairs(attackKeywords) do
+        if string.find(name, kw, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function handleAttack(obj)
+    if not settings.RemoveAttacks then return end
+    if isAttack(obj) then
+        if obj:IsA("BasePart") then
+            obj.CanCollide = false
+            obj.Transparency = 1
+            obj.Size = Vector3.new(0, 0, 0)
+        end
+        obj:Destroy()
+    end
+end
+
+workspace.DescendantAdded:Connect(handleAttack)
+
+-- ============================================================
+-- 3. АВТО-БЛОКИРОВКА РЕМОУТОВ
+-- ============================================================
+local dangerKeywords = {"damage", "hit", "hurt", "health", "take", "attack", "kill", "die", "death", "touch"}
+
+local function isDangerous(name)
+    local lower = string.lower(name)
+    for _, kw in ipairs(dangerKeywords) do
+        if string.find(lower, kw, 1, true) then return true end
+    end
+    return false
+end
+
+local function disableRemotes()
+    if not getconnections then
+        print("[worm shadow] getconnections не поддерживается")
+        return
+    end
+    local count = 0
+    local areas = {game.ReplicatedStorage, player:FindFirstChild("PlayerScripts"), workspace}
+    
+    for _, area in ipairs(areas) do
+        if not area then continue end
+        for _, obj in ipairs(area:GetDescendants()) do
+            if obj:IsA("RemoteEvent") and isDangerous(obj.Name) then
+                local conns = getconnections(obj.OnClientEvent)
+                for _, c in ipairs(conns) do
+                    if c.Disable then
+                        c:Disable()
+                        count = count + 1
+                    end
+                end
+            end
+        end
+    end
+    print("[worm shadow] заблокировано подключений: " .. count)
+end
+
+-- ============================================================
+-- 4. МЕНЮ
+-- ============================================================
+local function createMenu()
+    local old = player.PlayerGui:FindFirstChild("WS_GodmodeMenu")
+    if old then old:Destroy() end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "WS_GodmodeMenu"
+    gui.ResetOnSpawn = false
+    gui.Parent = player.PlayerGui
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(0, 240, 0, 280)
+    frame.Position = UDim2.new(0, 20, 0, 20)
+    frame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+    frame.BorderSizePixel = 0
+    frame.Active = true
+    frame.Parent = gui
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = frame
+
+    local titleBar = Instance.new("Frame")
+    titleBar.Size = UDim2.new(1, 0, 0, 32)
+    titleBar.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
+    titleBar.BorderSizePixel = 0
+    titleBar.Parent = frame
+    local tCorner = Instance.new("UICorner")
+    tCorner.CornerRadius = UDim.new(0, 8)
+    tCorner.Parent = titleBar
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -10, 1, 0)
+    title.Position = UDim2.new(0, 10, 0, 0)
+    title.BackgroundTransparency = 1
+    title.Text = "worm shadow 🪱"
+    title.TextColor3 = Color3.fromRGB(255, 212, 0)
+    title.TextSize = 14
+    title.Font = Enum.Font.GothamBold
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = titleBar
+
+    local content = Instance.new("Frame")
+    content.Size = UDim2.new(1, -20, 1, -42)
+    content.Position = UDim2.new(0, 10, 0, 38)
+    content.BackgroundTransparency = 1
+    content.Parent = frame
+
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0, 8)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Parent = content
+
+    local function addToggle(name, key, callback)
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(1, 0, 0, 32)
+        btn.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
+        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        btn.TextSize = 13
+        btn.Font = Enum.Font.Gotham
+        btn.Text = name .. ": " .. (settings[key] and "ON" or "OFF")
+        btn.Parent = content
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 6)
+        c.Parent = btn
+
+        btn.MouseButton1Click:Connect(function()
+            settings[key] = not settings[key]
+            btn.Text = name .. ": " .. (settings[key] and "ON" or "OFF")
+            if callback then callback(settings[key]) end
+        end)
+    end
+
+    addToggle("Godmode (Health)", "Godmode")
+    addToggle("Block TakeDamage", "BlockTakeDamage")
+    addToggle("Remove Attacks", "RemoveAttacks")
+    
+    local disableBtn = Instance.new("TextButton")
+    disableBtn.Size = UDim2.new(1, 0, 0, 32)
+    disableBtn.BackgroundColor3 = Color3.fromRGB(80, 30, 30)
+    disableBtn.TextColor3 = Color3.fromRGB(255, 150, 150)
+    disableBtn.TextSize = 13
+    disableBtn.Font = Enum.Font.GothamBold
+    disableBtn.Text = "⚠ Disable Damage Remotes"
+    disableBtn.Parent = content
+    local dc = Instance.new("UICorner")
+    dc.CornerRadius = UDim.new(0, 6)
+    dc.Parent = disableBtn
+
+    disableBtn.MouseButton1Click:Connect(function()
+        disableRemotes()
+        disableBtn.Text = "✔ Remotes Disabled"
+        disableBtn.BackgroundColor3 = Color3.fromRGB(30, 80, 30)
+        disableBtn.TextColor3 = Color3.fromRGB(150, 255, 150)
+    end)
+
+    -- Драг
+    local dragging, dragStart, startPos
+    titleBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true
+            dragStart = input.Position
+            startPos = frame.Position
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+            local delta = input.Position - dragStart
+            frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+    end)
+end
+
+createMenu()
