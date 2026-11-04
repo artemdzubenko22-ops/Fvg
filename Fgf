@@ -1,249 +1,353 @@
--- worm shadow 🪱 | auto godmode + damage blocker
-local Players = game:GetService("Players")
+-- worm shadow 🪱 | local attack auto-delete + click-delete + protect
+-- NOTE: local only. server unaffected. if the game does server-side hit
+-- detection, deleting the visual part won't stop the damage.
+
+local Players    = game:GetService("Players")
+local UIS        = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
+local CS         = game:GetService("CollectionService")
 
 local player = Players.LocalPlayer
-local settings = {
-    Godmode = true,
-    BlockTakeDamage = true,
-    RemoveAttacks = true,
-    DisableRemotes = false, -- по умолчанию выкл, чтобы не сломать игру сразу
+if not player then return end
+local playerGui = player:WaitForChild("PlayerGui")
+
+local state = {
+    autoDelete  = false,
+    clickDelete = false,
+    protectMode = false,
+    radius      = 60,
+    _lastTick   = 0,
+    _deleted    = 0,
+    _lastDel    = "—",
 }
 
--- ============================================================
--- 1. ЗАЩИТА HUMANOD (годмод и хук урона)
--- ============================================================
-local oldTakeDamage = nil
+--==================================================
+-- DANGER CRITERIA
+--==================================================
+local ATK_KEYS = {
+    "attack","damage","hit","punch","swing","slash","shoot","shot",
+    "fire","explode","bomb","projectile","bullet","beam","melee","stab",
+    "strike","kill","hurt","weapon","sword","blast","pierce","lunge",
+    "hazard","hitbox","danger","knife","spike","bone","gaster","blaster",
+    "meteor","zone","ring","circle","warn","telegraph","marker","indicator",
+}
+local HOT_TAGS = {
+    "Projectile","Attack","Damage","Hitbox","Hazard",
+    "DamageZone","Bullet","Enemy","Kill","Danger",
+    "Telegraph","Warning","DangerZone","AOE","Indicator",
+}
 
-local function setupHumanoid(char)
-    local hum = char:WaitForChild("Humanoid", 5)
-    if not hum then return end
+local nameCache = setmetatable({}, {__mode = "k"})
+local function nameIsAttack(name)
+    local c = nameCache[name]
+    if c ~= nil then return c end
+    local n = string.lower(name)
+    local r = false
+    for i = 1, #ATK_KEYS do
+        if string.find(n, ATK_KEYS[i], 1, true) then r = true; break end
+    end
+    nameCache[name] = r
+    return r
+end
 
-    -- Годмод (постоянная регенерация)
-    task.spawn(function()
-        while char.Parent and hum.Parent do
-            if settings.Godmode then
-                hum.Health = hum.MaxHealth
-            end
-            task.wait(0.1)
+local tagCache = setmetatable({}, {__mode = "k"})
+local function hasHotTag(part)
+    local c = tagCache[part]
+    if c and os.clock() - c.t < 1 then return c.r end
+    local r = false
+    for i = 1, #HOT_TAGS do
+        if CS:HasTag(part, HOT_TAGS[i]) then r = true; break end
+    end
+    tagCache[part] = { r = r, t = os.clock() }
+    return r
+end
+
+--==================================================
+-- CHARACTER (morph-safe)
+--==================================================
+local char, primary, hum = nil, nil, nil
+local function resolvePrimary(c)
+    if not c then return nil end
+    if c.PrimaryPart and c.PrimaryPart:IsA("BasePart") then return c.PrimaryPart end
+    local hrp = c:FindFirstChild("HumanoidRootPart")
+    if hrp and hrp:IsA("BasePart") then return hrp end
+    local rp = c:FindFirstChild("RootPart")
+    if rp and rp:IsA("BasePart") then return rp end
+    for _, n in ipairs({"root","ROOT","Torso","UpperTorso","Head"}) do
+        local p = c:FindFirstChild(n)
+        if p and p:IsA("BasePart") then return p end
+    end
+    for _, d in ipairs(c:GetDescendants()) do
+        if d:IsA("BasePart") then return d end
+    end
+    return nil
+end
+local function resolveHumanoid(c)
+    if not c then return nil end
+    local h = c:FindFirstChildOfClass("Humanoid")
+    if h then return h end
+    for _, d in ipairs(c:GetDescendants()) do
+        if d:IsA("Humanoid") then return d end
+    end
+    return nil
+end
+local function ensureValid()
+    if not char or not char.Parent then return false end
+    if not primary or not primary.Parent or not primary:IsDescendantOf(char) then
+        primary = resolvePrimary(char)
+    end
+    if not hum or not hum.Parent or not hum:IsDescendantOf(char) then
+        hum = resolveHumanoid(char)
+    end
+    return primary ~= nil
+end
+local function updateChar(c)
+    char = c; primary = nil; hum = nil
+    if c then
+        primary = resolvePrimary(c)
+        hum = resolveHumanoid(c)
+    end
+end
+player.CharacterAdded:Connect(updateChar)
+player.CharacterRemoving:Connect(function() char, primary, hum = nil, nil, nil end)
+if player.Character then updateChar(player.Character) end
+task.spawn(function()
+    while true do
+        task.wait(0.15)
+        if player.Character and player.Character ~= char then
+            updateChar(player.Character)
+        elseif char then
+            ensureValid()
         end
-    end)
+    end
+end)
 
-    -- Хук на TakeDamage (если поддерживается)
-    if hookfunction and not oldTakeDamage then
-        local success, err = pcall(function()
-            oldTakeDamage = hookfunction(hum.TakeDamage, function(self, amount)
-                if settings.BlockTakeDamage then
-                    return 0
-                end
-                return oldTakeDamage(self, amount)
-            end)
-        end)
-        if not success then
-            print("[worm shadow] хуки недоступны, используем только регенерацию")
+--==================================================
+-- PROTECT LIST (RMB)
+--==================================================
+local protect = setmetatable({}, {__mode = "k"})
+local protectMark = setmetatable({}, {__mode = "k"})
+
+local function setProtected(part, on)
+    if not part or not part:IsA("BasePart") then return end
+    if on then
+        protect[part] = true
+        if not protectMark[part] or not protectMark[part].Parent then
+            local h = Instance.new("Highlight")
+            h.FillColor = Color3.fromRGB(80, 200, 255)
+            h.OutlineColor = Color3.fromRGB(80, 200, 255)
+            h.FillTransparency = 0.8
+            h.OutlineTransparency = 0
+            h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+            h.Adornee = part
+            h.Parent = part
+            protectMark[part] = h
+        end
+    else
+        protect[part] = nil
+        if protectMark[part] then
+            protectMark[part]:Destroy()
+            protectMark[part] = nil
         end
     end
 end
 
-if player.Character then
-    setupHumanoid(player.Character)
-end
-player.CharacterAdded:Connect(setupHumanoid)
+--==================================================
+-- AUTO DELETE
+--==================================================
+local scanParams = OverlapParams.new()
+scanParams.FilterType = Enum.RaycastFilterType.Exclude
+scanParams.MaxParts = 800
 
--- ============================================================
--- 2. УДАЛЕНИЕ АТАК (визуал)
--- ============================================================
-local attackKeywords = {
-    "attack", "projectile", "bone", "blaster", "beam", "spike", "wave", 
-    "slash", "hitbox", "bullet", "laser", "orb", "shockwave", "damage"
-}
-local attackFolders = {"attacks", "effects", "projectiles", "vfx", "hitbox"}
+local function shouldDelete(part)
+    if not part or not part.Parent then return false end
+    if char and part:IsDescendantOf(char) then return false end
+    if protect[part] then return false end
+    if part.Anchored and part.Size.Magnitude > 80 then return false end
 
-local function isAttack(obj)
-    if not obj then return false end
-    if not obj:IsA("BasePart") and not obj:IsA("Model") then return false end
-    local parent = obj.Parent
-    if parent and table.find(attackFolders, string.lower(parent.Name)) then
+    if nameIsAttack(part.Name) then return true end
+    if hasHotTag(part) then return true end
+
+    -- маленький парт с fx-ребёнком = снаряд/визуал атаки
+    if part.Size.Magnitude < 30 then
+        if part:FindFirstChildWhichIsA("Beam")
+           or part:FindFirstChildWhichIsA("ParticleEmitter")
+           or part:FindFirstChildWhichIsA("Trail") then return true end
+    end
+
+    -- маленький движущийся не-анкоренный = летящий снаряд/моб
+    local vel = part.AssemblyLinearVelocity
+    if not part.Anchored and vel.Magnitude > 2 and part.Size.Magnitude < 20 then
         return true
     end
-    local name = string.lower(obj.Name)
-    for _, kw in ipairs(attackKeywords) do
-        if string.find(name, kw, 1, true) then
-            return true
-        end
-    end
+
     return false
 end
 
-local function handleAttack(obj)
-    if not settings.RemoveAttacks then return end
-    if isAttack(obj) then
-        if obj:IsA("BasePart") then
-            obj.CanCollide = false
-            obj.Transparency = 1
-            obj.Size = Vector3.new(0, 0, 0)
+local function autoDeleteTick()
+    if not state.autoDelete then return end
+    if not ensureValid() then return end
+    local now = os.clock()
+    if now - state._lastTick < 1/30 then return end
+    state._lastTick = now
+
+    local myPos = primary.Position
+    scanParams.FilterDescendantsInstances = { char }
+    local parts = workspace:GetPartBoundsInRadius(myPos, state.radius, scanParams)
+
+    for i = 1, #parts do
+        local p = parts[i]
+        if shouldDelete(p) then
+            local pname = p.Name
+            pcall(function() p:Destroy() end)
+            state._deleted += 1
+            state._lastDel = pname
         end
-        obj:Destroy()
     end
 end
 
-workspace.DescendantAdded:Connect(handleAttack)
+RunService.Heartbeat:Connect(autoDeleteTick)
 
--- ============================================================
--- 3. АВТО-БЛОКИРОВКА РЕМОУТОВ
--- ============================================================
-local dangerKeywords = {"damage", "hit", "hurt", "health", "take", "attack", "kill", "die", "death", "touch"}
+--==================================================
+-- CLICK DELETE / PROTECT
+--==================================================
+local camera = workspace.CurrentCamera
+workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+    camera = workspace.CurrentCamera
+end)
 
-local function isDangerous(name)
-    local lower = string.lower(name)
-    for _, kw in ipairs(dangerKeywords) do
-        if string.find(lower, kw, 1, true) then return true end
+local clickParams = RaycastParams.new()
+clickParams.FilterType = Enum.RaycastFilterType.Exclude
+
+UIS.InputBegan:Connect(function(input, processed)
+    if processed then return end
+    if not camera then camera = workspace.CurrentCamera end
+    if not camera then return end
+
+    local isLMB = input.UserInputType == Enum.UserInputType.MouseButton1
+    local isRMB = input.UserInputType == Enum.UserInputType.MouseButton2
+    if not (isLMB or isRMB) then return end
+    if isLMB and not state.clickDelete then return end
+    if isRMB and not state.protectMode then return end
+
+    local mp = UIS:GetMouseLocation()
+    local ray = camera:ViewportPointToRay(mp.X, mp.Y)
+    clickParams.FilterDescendantsInstances = { char, camera }
+    local result = workspace:Raycast(ray.Origin, ray.Direction * 5000, clickParams)
+
+    if not result or not result.Instance or not result.Instance:IsA("BasePart") then return end
+    local part = result.Instance
+    if char and part:IsDescendantOf(char) then return end
+
+    if isLMB and state.clickDelete then
+        local pname = part.Name
+        pcall(function() part:Destroy() end)
+        state._deleted += 1
+        state._lastDel = pname
+    elseif isRMB and state.protectMode then
+        setProtected(part, not protect[part])
     end
-    return false
+end)
+
+--==================================================
+-- UI
+--==================================================
+local function mkBtn(parent, text, pos, size, bg)
+    local b = Instance.new("TextButton")
+    b.Position = pos; b.Size = size
+    b.BackgroundColor3 = bg or Color3.fromRGB(60, 30, 50)
+    b.BorderSizePixel = 0; b.Text = text
+    b.TextColor3 = Color3.new(1,1,1); b.TextScaled = true
+    b.Font = Enum.Font.GothamBold
+    b.AutoButtonColor = true; b.Parent = parent
+    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 4); c.Parent = b
+    return b
 end
 
-local function disableRemotes()
-    if not getconnections then
-        print("[worm shadow] getconnections не поддерживается")
-        return
-    end
-    local count = 0
-    local areas = {game.ReplicatedStorage, player:FindFirstChild("PlayerScripts"), workspace}
-    
-    for _, area in ipairs(areas) do
-        if not area then continue end
-        for _, obj in ipairs(area:GetDescendants()) do
-            if obj:IsA("RemoteEvent") and isDangerous(obj.Name) then
-                local conns = getconnections(obj.OnClientEvent)
-                for _, c in ipairs(conns) do
-                    if c.Disable then
-                        c:Disable()
-                        count = count + 1
-                    end
-                end
-            end
-        end
-    end
-    print("[worm shadow] заблокировано подключений: " .. count)
-end
+local gui = Instance.new("ScreenGui")
+gui.Name = "FNV_Del"; gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true; gui.DisplayOrder = 60; gui.Parent = playerGui
 
--- ============================================================
--- 4. МЕНЮ
--- ============================================================
-local function createMenu()
-    local old = player.PlayerGui:FindFirstChild("WS_GodmodeMenu")
-    if old then old:Destroy() end
+local frame = Instance.new("Frame")
+frame.Size = UDim2.fromOffset(270, 330)
+frame.Position = UDim2.new(0, 20, 0, 20)
+frame.BackgroundColor3 = Color3.fromRGB(18, 18, 25)
+frame.BorderSizePixel = 0; frame.Active = true
+frame.Parent = gui
+local fc = Instance.new("UICorner"); fc.CornerRadius = UDim.new(0, 8); fc.Parent = frame
+local fs = Instance.new("UIStroke"); fs.Color = Color3.fromRGB(255, 40, 65); fs.Thickness = 1.5; fs.Parent = frame
 
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "WS_GodmodeMenu"
-    gui.ResetOnSpawn = false
-    gui.Parent = player.PlayerGui
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, 0, 0, 22); title.BackgroundTransparency = 1
+title.Text = "FNV attack delete"; title.TextColor3 = Color3.fromRGB(255, 60, 80)
+title.TextScaled = true; title.Font = Enum.Font.GothamBold; title.Parent = frame
 
-    local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 240, 0, 280)
-    frame.Position = UDim2.new(0, 20, 0, 20)
-    frame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
-    frame.BorderSizePixel = 0
-    frame.Active = true
-    frame.Parent = gui
+local autoBtn = mkBtn(frame, "AUTO DELETE: OFF", UDim2.fromOffset(8, 28), UDim2.new(1, -16, 0, 26))
+autoBtn.Activated:Connect(function()
+    state.autoDelete = not state.autoDelete
+    autoBtn.Text = "AUTO DELETE: " .. (state.autoDelete and "ON" or "OFF")
+    autoBtn.BackgroundColor3 = state.autoDelete
+        and Color3.fromRGB(35, 115, 65) or Color3.fromRGB(60, 30, 50)
+end)
 
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 8)
-    corner.Parent = frame
+local clickBtn = mkBtn(frame, "CLICK DELETE (LMB): OFF", UDim2.fromOffset(8, 58), UDim2.new(1, -16, 0, 26))
+clickBtn.Activated:Connect(function()
+    state.clickDelete = not state.clickDelete
+    clickBtn.Text = "CLICK DELETE (LMB): " .. (state.clickDelete and "ON" or "OFF")
+    clickBtn.BackgroundColor3 = state.clickDelete
+        and Color3.fromRGB(35, 115, 65) or Color3.fromRGB(60, 30, 50)
+end)
 
-    local titleBar = Instance.new("Frame")
-    titleBar.Size = UDim2.new(1, 0, 0, 32)
-    titleBar.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
-    titleBar.BorderSizePixel = 0
-    titleBar.Parent = frame
-    local tCorner = Instance.new("UICorner")
-    tCorner.CornerRadius = UDim.new(0, 8)
-    tCorner.Parent = titleBar
+local protBtn = mkBtn(frame, "PROTECT (RMB): OFF", UDim2.fromOffset(8, 88), UDim2.new(1, -16, 0, 26))
+protBtn.Activated:Connect(function()
+    state.protectMode = not state.protectMode
+    protBtn.Text = "PROTECT (RMB): " .. (state.protectMode and "ON" or "OFF")
+    protBtn.BackgroundColor3 = state.protectMode
+        and Color3.fromRGB(30, 80, 150) or Color3.fromRGB(60, 30, 50)
+end)
 
-    local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, -10, 1, 0)
-    title.Position = UDim2.new(0, 10, 0, 0)
-    title.BackgroundTransparency = 1
-    title.Text = "worm shadow 🪱"
-    title.TextColor3 = Color3.fromRGB(255, 212, 0)
-    title.TextSize = 14
-    title.Font = Enum.Font.GothamBold
-    title.TextXAlignment = Enum.TextXAlignment.Left
-    title.Parent = titleBar
+local rLabel = Instance.new("TextLabel")
+rLabel.Position = UDim2.fromOffset(8, 122); rLabel.Size = UDim2.new(1, -52, 0, 18)
+rLabel.BackgroundTransparency = 1
+rLabel.Text = "radius: " .. state.radius
+rLabel.TextColor3 = Color3.fromRGB(255, 200, 80); rLabel.TextScaled = true
+rLabel.Font = Enum.Font.Code; rLabel.TextXAlignment = Enum.TextXAlignment.Left
+rLabel.Parent = frame
 
-    local content = Instance.new("Frame")
-    content.Size = UDim2.new(1, -20, 1, -42)
-    content.Position = UDim2.new(0, 10, 0, 38)
-    content.BackgroundTransparency = 1
-    content.Parent = frame
-
-    local layout = Instance.new("UIListLayout")
-    layout.Padding = UDim.new(0, 8)
-    layout.SortOrder = Enum.SortOrder.LayoutOrder
-    layout.Parent = content
-
-    local function addToggle(name, key, callback)
-        local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(1, 0, 0, 32)
-        btn.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
-        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-        btn.TextSize = 13
-        btn.Font = Enum.Font.Gotham
-        btn.Text = name .. ": " .. (settings[key] and "ON" or "OFF")
-        btn.Parent = content
-        local c = Instance.new("UICorner")
-        c.CornerRadius = UDim.new(0, 6)
-        c.Parent = btn
-
-        btn.MouseButton1Click:Connect(function()
-            settings[key] = not settings[key]
-            btn.Text = name .. ": " .. (settings[key] and "ON" or "OFF")
-            if callback then callback(settings[key]) end
-        end)
-    end
-
-    addToggle("Godmode (Health)", "Godmode")
-    addToggle("Block TakeDamage", "BlockTakeDamage")
-    addToggle("Remove Attacks", "RemoveAttacks")
-    
-    local disableBtn = Instance.new("TextButton")
-    disableBtn.Size = UDim2.new(1, 0, 0, 32)
-    disableBtn.BackgroundColor3 = Color3.fromRGB(80, 30, 30)
-    disableBtn.TextColor3 = Color3.fromRGB(255, 150, 150)
-    disableBtn.TextSize = 13
-    disableBtn.Font = Enum.Font.GothamBold
-    disableBtn.Text = "⚠ Disable Damage Remotes"
-    disableBtn.Parent = content
-    local dc = Instance.new("UICorner")
-    dc.CornerRadius = UDim.new(0, 6)
-    dc.Parent = disableBtn
-
-    disableBtn.MouseButton1Click:Connect(function()
-        disableRemotes()
-        disableBtn.Text = "✔ Remotes Disabled"
-        disableBtn.BackgroundColor3 = Color3.fromRGB(30, 80, 30)
-        disableBtn.TextColor3 = Color3.fromRGB(150, 255, 150)
+mkBtn(frame, "−", UDim2.new(1, -46, 0, 122), UDim2.fromOffset(22, 18))
+    .Activated:Connect(function()
+        state.radius = math.max(5, state.radius - 5)
+        rLabel.Text = "radius: " .. state.radius
+    end)
+mkBtn(frame, "+", UDim2.new(1, -22, 0, 122), UDim2.fromOffset(22, 18))
+    .Activated:Connect(function()
+        state.radius = math.min(200, state.radius + 5)
+        rLabel.Text = "radius: " .. state.radius
     end)
 
-    -- Драг
-    local dragging, dragStart, startPos
-    titleBar.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 then
-            dragging = true
-            dragStart = input.Position
-            startPos = frame.Position
-        end
-    end)
-    UserInputService.InputChanged:Connect(function(input)
-        if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
-            local delta = input.Position - dragStart
-            frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
-        end
-    end)
-    UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
-    end)
-end
+local stats = Instance.new("TextLabel")
+stats.Position = UDim2.fromOffset(8, 148); stats.Size = UDim2.new(1, -16, 0, 16)
+stats.BackgroundTransparency = 1
+stats.Text = "deleted: 0"; stats.TextColor3 = Color3.fromRGB(150, 255, 180)
+stats.TextScaled = true; stats.Font = Enum.Font.Code; stats.Parent = frame
 
-createMenu()
+local lastLbl = Instance.new("TextLabel")
+lastLbl.Position = UDim2.fromOffset(8, 166); lastLbl.Size = UDim2.new(1, -16, 0, 16)
+lastLbl.BackgroundTransparency = 1
+lastLbl.Text = "last: —"; lastLbl.TextColor3 = Color3.fromRGB(255, 200, 80)
+lastLbl.TextScaled = true; lastLbl.Font = Enum.Font.Code; lastLbl.Parent = frame
+
+local info = Instance.new("TextLabel")
+info.Position = UDim2.fromOffset(8, 190); info.Size = UDim2.new(1, -16, 0, 130)
+info.BackgroundTransparency = 1; info.TextXAlignment = Enum.TextXAlignment.Left
+info.TextYAlignment = Enum.TextYAlignment.Top
+info.TextColor3 = Color3.fromRGB(200, 200, 220); info.TextSize = 9
+info.Font = Enum.Font.Gotham; info.TextWrapped = true; info.Parent = frame
+info.Text = "AUTO DELETE — удаляет опасные парты в радиусе (по имени, тегу, fx, скорости).\n\nCLICK DELETE — ЛКМ удаляет любой парт по клику. тест-мод.\n\nPROTECT — ПКМ помечает парт синим, auto-delete его не тронет.\n\nВсё локально. Сервер не затронут. Если игра считает попадание на сервере — урон всё равно придёт."
+
+RunService.Heartbeat:Connect(function()
+    stats.Text = "deleted: " .. state._deleted
+    lastLbl.Text = "last: " .. state._lastDel
+end)
+
+print("[worm shadow] delete tool loaded.")
