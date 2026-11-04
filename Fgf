@@ -1,6 +1,6 @@
--- worm shadow 🪱 | local attack auto-delete + click-delete + protect
--- NOTE: local only. server unaffected. if the game does server-side hit
--- detection, deleting the visual part won't stop the damage.
+-- worm shadow 🪱 | local attack auto-delete + damage-learn + boss-protect
+-- read-only HealthChanged (no HP restore, no TakeDamage hook)
+-- local only. server unaffected.
 
 local Players    = game:GetService("Players")
 local UIS        = game:GetService("UserInputService")
@@ -12,17 +12,22 @@ if not player then return end
 local playerGui = player:WaitForChild("PlayerGui")
 
 local state = {
-    autoDelete  = false,
-    clickDelete = false,
-    protectMode = false,
-    radius      = 60,
-    _lastTick   = 0,
-    _deleted    = 0,
-    _lastDel    = "—",
+    autoDelete   = false,
+    clickDelete  = false,
+    protectMode  = false,
+    learnMode    = true,
+    radius       = 60,
+    learnRadius  = 90,
+    _lastTick    = 0,
+    _deleted     = 0,
+    _lastDel     = "—",
+    _hits        = 0,
+    _lastHitName = "—",
+    _learnedN    = 0,
 }
 
 --==================================================
--- DANGER CRITERIA
+-- ATTACK VOCAB
 --==================================================
 local ATK_KEYS = {
     "attack","damage","hit","punch","swing","slash","shoot","shot",
@@ -30,25 +35,34 @@ local ATK_KEYS = {
     "strike","kill","hurt","weapon","sword","blast","pierce","lunge",
     "hazard","hitbox","danger","knife","spike","bone","gaster","blaster",
     "meteor","zone","ring","circle","warn","telegraph","marker","indicator",
+    "orb","ball","wave","burst","spark","missile","arrow","shard",
 }
 local HOT_TAGS = {
     "Projectile","Attack","Damage","Hitbox","Hazard",
     "DamageZone","Bullet","Enemy","Kill","Danger",
-    "Telegraph","Warning","DangerZone","AOE","Indicator",
+    "Telegraph","Warning","DangerZone","AOE","Indicator","AttackPart",
+}
+local BOSS_KEYS = {
+    "boss","босс","elite","guard","enemy","monster","mob","npc",
+    "champion","miniboss","raid","chief","lord","king","queen",
 }
 
 local nameCache = setmetatable({}, {__mode = "k"})
-local function nameIsAttack(name)
+local function nameMatches(name, keys)
     local c = nameCache[name]
-    if c ~= nil then return c end
+    if c == nil then c = {}; nameCache[name] = c end
+    local key = tostring(keys)
+    if c[key] ~= nil then return c[key] end
     local n = string.lower(name)
     local r = false
-    for i = 1, #ATK_KEYS do
-        if string.find(n, ATK_KEYS[i], 1, true) then r = true; break end
+    for i = 1, #keys do
+        if string.find(n, keys[i], 1, true) then r = true; break end
     end
-    nameCache[name] = r
+    c[key] = r
     return r
 end
+local function nameIsAttack(n) return nameMatches(n, ATK_KEYS) end
+local function nameIsBoss(n)   return nameMatches(n, BOSS_KEYS) end
 
 local tagCache = setmetatable({}, {__mode = "k"})
 local function hasHotTag(part)
@@ -63,9 +77,11 @@ local function hasHotTag(part)
 end
 
 --==================================================
--- CHARACTER (morph-safe)
+-- CHARACTER
 --==================================================
 local char, primary, hum = nil, nil, nil
+local humConn = nil
+
 local function resolvePrimary(c)
     if not c then return nil end
     if c.PrimaryPart and c.PrimaryPart:IsA("BasePart") then return c.PrimaryPart end
@@ -97,36 +113,23 @@ local function ensureValid()
         primary = resolvePrimary(char)
     end
     if not hum or not hum.Parent or not hum:IsDescendantOf(char) then
-        hum = resolveHumanoid(char)
+        local nh = resolveHumanoid(char)
+        if nh ~= hum then
+            hum = nh
+            if humConn then humConn:Disconnect(); humConn = nil end
+            if hum then
+                state._lastHP = hum.Health
+            end
+        end
     end
     return primary ~= nil
 end
-local function updateChar(c)
-    char = c; primary = nil; hum = nil
-    if c then
-        primary = resolvePrimary(c)
-        hum = resolveHumanoid(c)
-    end
-end
-player.CharacterAdded:Connect(updateChar)
-player.CharacterRemoving:Connect(function() char, primary, hum = nil, nil, nil end)
-if player.Character then updateChar(player.Character) end
-task.spawn(function()
-    while true do
-        task.wait(0.15)
-        if player.Character and player.Character ~= char then
-            updateChar(player.Character)
-        elseif char then
-            ensureValid()
-        end
-    end
-end)
 
 --==================================================
--- PROTECT LIST (RMB)
+-- PROTECT + LEARNED
 --==================================================
-local protect = setmetatable({}, {__mode = "k"})
-local protectMark = setmetatable({}, {__mode = "k"})
+local protect      = setmetatable({}, {__mode = "k"})
+local protectMark  = setmetatable({}, {__mode = "k"})
 
 local function setProtected(part, on)
     if not part or not part:IsA("BasePart") then return end
@@ -152,39 +155,110 @@ local function setProtected(part, on)
     end
 end
 
+-- learned: [key] = { conf = N, name = "...", class = "...", lastSeen = t }
+local learned     = {}
+local learnedMark = {}
+
+local function patternKey(part)
+    return part.Name .. "|" .. part.ClassName
+end
+
+local function reinforcePattern(part, weight)
+    local key = patternKey(part)
+    local l = learned[key]
+    if not l then
+        l = { conf = 0, name = part.Name, class = part.ClassName, lastSeen = 0 }
+        learned[key] = l
+    end
+    l.conf = l.conf + (weight or 1)
+    l.lastSeen = os.clock()
+    state._learnedN = 0
+    for _ in pairs(learned) do state._learnedN = state._learnedN + 1 end
+end
+
+local function isLearnedDanger(part)
+    local key = patternKey(part)
+    local l = learned[key]
+    if l and l.conf >= 2 then return true end
+    return false
+end
+
 --==================================================
--- AUTO DELETE
+-- BOSS / NPC PROTECT
+--==================================================
+local function isProtectedEntity(part)
+    if not part or not part.Parent then return true end
+    if protect[part] then return true end
+    if char and part:IsDescendantOf(char) then return true end
+
+    -- большой объект = структура/босс
+    if part.Size.Magnitude > 60 then return true end
+
+    -- человекоидный NPC (в самом парте или в модели-родителе)
+    if part:FindFirstChildOfClass("Humanoid") then return true end
+    local model = part:FindFirstAncestorOfClass("Model")
+    if model then
+        local h = model:FindFirstChildOfClass("Humanoid")
+        if h then
+            -- большой HP = босс
+            if h.MaxHealth >= 1000 then return true end
+            -- имя модели / хитробота = босс
+            if nameIsBoss(model.Name) or nameIsBoss(h.Name) then return true end
+            -- любой NPC = не трогаем (это тело, не снаряд)
+            return true
+        end
+    end
+    -- имя парта как босс
+    if nameIsBoss(part.Name) then return true end
+
+    -- высокий HP в самом парте (Health property)
+    local hp = part:GetAttribute("Health") or part:GetAttribute("HP")
+    if typeof(hp) == "number" and hp >= 1000 then return true end
+
+    return false
+end
+
+--==================================================
+-- AUTO-DELETE PREDICATE
+--==================================================
+local function shouldDelete(part)
+    if not part or not part.Parent then return false end
+    if char and part:IsDescendantOf(char) then return false end
+    if isProtectedEntity(part) then return false end
+
+    -- learned pattern = приоритет
+    if isLearnedDanger(part) then return true end
+
+    -- attack by name / tag
+    if nameIsAttack(part.Name) then return true end
+    if hasHotTag(part) then return true end
+
+    -- small fx part
+    if part.Size.Magnitude < 30 then
+        if part:FindFirstChildWhichIsA("Beam")
+           or part:FindFirstChildWhichIsA("ParticleEmitter")
+           or part:FindFirstChildWhichIsA("Trail")
+           or part:FindFirstChildWhichIsA("Fire") then
+            return true
+        end
+    end
+
+    -- fast small mover
+    local vel = part.AssemblyLinearVelocity
+    if not part.Anchored and vel.Magnitude > 2 and part.Size.Magnitude < 20 then
+        return true
+    end
+    return false
+end
+
+--==================================================
+-- AUTO DELETE TICK
 --==================================================
 local scanParams = OverlapParams.new()
 scanParams.FilterType = Enum.RaycastFilterType.Exclude
 scanParams.MaxParts = 800
 
-local function shouldDelete(part)
-    if not part or not part.Parent then return false end
-    if char and part:IsDescendantOf(char) then return false end
-    if protect[part] then return false end
-    if part.Anchored and part.Size.Magnitude > 80 then return false end
-
-    if nameIsAttack(part.Name) then return true end
-    if hasHotTag(part) then return true end
-
-    -- маленький парт с fx-ребёнком = снаряд/визуал атаки
-    if part.Size.Magnitude < 30 then
-        if part:FindFirstChildWhichIsA("Beam")
-           or part:FindFirstChildWhichIsA("ParticleEmitter")
-           or part:FindFirstChildWhichIsA("Trail") then return true end
-    end
-
-    -- маленький движущийся не-анкоренный = летящий снаряд/моб
-    local vel = part.AssemblyLinearVelocity
-    if not part.Anchored and vel.Magnitude > 2 and part.Size.Magnitude < 20 then
-        return true
-    end
-
-    return false
-end
-
-local function autoDeleteTick()
+RunService.Heartbeat:Connect(function()
     if not state.autoDelete then return end
     if not ensureValid() then return end
     local now = os.clock()
@@ -198,15 +272,93 @@ local function autoDeleteTick()
     for i = 1, #parts do
         local p = parts[i]
         if shouldDelete(p) then
-            local pname = p.Name
+            local nm = p.Name
             pcall(function() p:Destroy() end)
             state._deleted += 1
-            state._lastDel = pname
+            state._lastDel = nm
         end
+    end
+end)
+
+--==================================================
+-- DAMAGE-LEARN (read-only HealthChanged)
+--==================================================
+local lastHP = nil
+local lastHitAt = 0
+
+local function snapshotAroundHit()
+    if not ensureValid() then return end
+    local myPos = primary.Position
+    scanParams.FilterDescendantsInstances = { char }
+    local parts = workspace:GetPartBoundsInRadius(myPos, state.learnRadius, scanParams)
+    local candidates = {}
+
+    for i = 1, #parts do
+        local p = parts[i]
+        if p and p.Parent
+           and not (char and p:IsDescendantOf(char))
+           and not isProtectedEntity(p) then
+            local dist = (p.Position - myPos).Magnitude
+            local vel = p.AssemblyLinearVelocity
+            local size = p.Size.Magnitude
+            local moving = vel.Magnitude > 1
+            local close = dist < state.learnRadius * 0.7
+            local small = size < 40
+            local tagged = hasHotTag(p)
+            local named  = nameIsAttack(p.Name)
+
+            -- скорим кто "подозрительнее"
+            local score = 0
+            if moving then score += 2 end
+            if close then score += 1 end
+            if small then score += 1 end
+            if tagged then score += 3 end
+            if named then score += 3 end
+            if dist < 15 then score += 2 end
+
+            if score >= 2 then
+                candidates[#candidates + 1] = { part = p, score = score, dist = dist }
+            end
+        end
+    end
+
+    -- топ-3 по score → reinforce
+    table.sort(candidates, function(a, b) return a.score > b.score end)
+    local n = math.min(3, #candidates)
+    for i = 1, n do
+        reinforcePattern(candidates[i].part, i == 1 and 3 or 1)
+    end
+
+    if n > 0 then
+        state._lastHitName = candidates[1].part.Name
     end
 end
 
-RunService.Heartbeat:Connect(autoDeleteTick)
+local function bindHumWatch()
+    if humConn then humConn:Disconnect(); humConn = nil end
+    if not hum then return end
+    lastHP = hum.Health
+    humConn = hum.HealthChanged:Connect(function(newHP)
+        if not state.learnMode then return end
+        if lastHP and newHP < lastHP - 0.01 then
+            state._hits += 1
+            lastHitAt = os.clock()
+            -- defer чтоб дать серверу спавнить парты за тот же кадр
+            task.defer(snapshotAroundHit)
+        end
+        lastHP = newHP
+    end)
+end
+
+-- дергаем bindHumWatch при смене hum (морф)
+task.spawn(function()
+    while true do
+        task.wait(0.3)
+        if ensureValid() and hum and humConn == nil then
+            bindHumWatch()
+        end
+    end
+end)
 
 --==================================================
 -- CLICK DELETE / PROTECT
@@ -223,7 +375,6 @@ UIS.InputBegan:Connect(function(input, processed)
     if processed then return end
     if not camera then camera = workspace.CurrentCamera end
     if not camera then return end
-
     local isLMB = input.UserInputType == Enum.UserInputType.MouseButton1
     local isRMB = input.UserInputType == Enum.UserInputType.MouseButton2
     if not (isLMB or isRMB) then return end
@@ -234,17 +385,16 @@ UIS.InputBegan:Connect(function(input, processed)
     local ray = camera:ViewportPointToRay(mp.X, mp.Y)
     clickParams.FilterDescendantsInstances = { char, camera }
     local result = workspace:Raycast(ray.Origin, ray.Direction * 5000, clickParams)
-
     if not result or not result.Instance or not result.Instance:IsA("BasePart") then return end
     local part = result.Instance
     if char and part:IsDescendantOf(char) then return end
 
-    if isLMB and state.clickDelete then
-        local pname = part.Name
+    if isLMB then
+        local nm = part.Name
         pcall(function() part:Destroy() end)
         state._deleted += 1
-        state._lastDel = pname
-    elseif isRMB and state.protectMode then
+        state._lastDel = nm
+    elseif isRMB then
         setProtected(part, not protect[part])
     end
 end)
@@ -269,85 +419,151 @@ gui.Name = "FNV_Del"; gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true; gui.DisplayOrder = 60; gui.Parent = playerGui
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(270, 330)
+frame.Size = UDim2.fromOffset(290, 430)
 frame.Position = UDim2.new(0, 20, 0, 20)
 frame.BackgroundColor3 = Color3.fromRGB(18, 18, 25)
-frame.BorderSizePixel = 0; frame.Active = true
-frame.Parent = gui
+frame.BorderSizePixel = 0; frame.Active = true; frame.Parent = gui
 local fc = Instance.new("UICorner"); fc.CornerRadius = UDim.new(0, 8); fc.Parent = frame
 local fs = Instance.new("UIStroke"); fs.Color = Color3.fromRGB(255, 40, 65); fs.Thickness = 1.5; fs.Parent = frame
 
 local title = Instance.new("TextLabel")
 title.Size = UDim2.new(1, 0, 0, 22); title.BackgroundTransparency = 1
-title.Text = "FNV attack delete"; title.TextColor3 = Color3.fromRGB(255, 60, 80)
+title.Text = "FNV auto-delete + learn"
+title.TextColor3 = Color3.fromRGB(255, 60, 80)
 title.TextScaled = true; title.Font = Enum.Font.GothamBold; title.Parent = frame
 
-local autoBtn = mkBtn(frame, "AUTO DELETE: OFF", UDim2.fromOffset(8, 28), UDim2.new(1, -16, 0, 26))
-autoBtn.Activated:Connect(function()
-    state.autoDelete = not state.autoDelete
-    autoBtn.Text = "AUTO DELETE: " .. (state.autoDelete and "ON" or "OFF")
-    autoBtn.BackgroundColor3 = state.autoDelete
-        and Color3.fromRGB(35, 115, 65) or Color3.fromRGB(60, 30, 50)
-end)
+local function toggleBtn(parent, y, textOn, textOff, getter, setter)
+    local b = mkBtn(parent, textOff, UDim2.fromOffset(8, y), UDim2.new(1, -16, 0, 26))
+    local function refresh()
+        local on = getter()
+        b.Text = on and textOn or textOff
+        b.BackgroundColor3 = on and Color3.fromRGB(35, 115, 65) or Color3.fromRGB(60, 30, 50)
+    end
+    b.Activated:Connect(function() setter(not getter()); refresh() end)
+    refresh(); return b
+end
 
-local clickBtn = mkBtn(frame, "CLICK DELETE (LMB): OFF", UDim2.fromOffset(8, 58), UDim2.new(1, -16, 0, 26))
-clickBtn.Activated:Connect(function()
-    state.clickDelete = not state.clickDelete
-    clickBtn.Text = "CLICK DELETE (LMB): " .. (state.clickDelete and "ON" or "OFF")
-    clickBtn.BackgroundColor3 = state.clickDelete
-        and Color3.fromRGB(35, 115, 65) or Color3.fromRGB(60, 30, 50)
-end)
+toggleBtn(frame, 28, "AUTO DELETE: ON", "AUTO DELETE: OFF",
+    function() return state.autoDelete end,
+    function(v) state.autoDelete = v end)
 
-local protBtn = mkBtn(frame, "PROTECT (RMB): OFF", UDim2.fromOffset(8, 88), UDim2.new(1, -16, 0, 26))
-protBtn.Activated:Connect(function()
-    state.protectMode = not state.protectMode
-    protBtn.Text = "PROTECT (RMB): " .. (state.protectMode and "ON" or "OFF")
-    protBtn.BackgroundColor3 = state.protectMode
-        and Color3.fromRGB(30, 80, 150) or Color3.fromRGB(60, 30, 50)
-end)
+toggleBtn(frame, 58, "LEARN ON DAMAGE: ON", "LEARN ON DAMAGE: OFF",
+    function() return state.learnMode end,
+    function(v) state.learnMode = v end)
+
+toggleBtn(frame, 88, "CLICK DELETE (LMB): ON", "CLICK DELETE (LMB): OFF",
+    function() return state.clickDelete end,
+    function(v) state.clickDelete = v end)
+
+toggleBtn(frame, 118, "PROTECT (RMB): ON", "PROTECT (RMB): OFF",
+    function() return state.protectMode end,
+    function(v) state.protectMode = v end)
 
 local rLabel = Instance.new("TextLabel")
-rLabel.Position = UDim2.fromOffset(8, 122); rLabel.Size = UDim2.new(1, -52, 0, 18)
-rLabel.BackgroundTransparency = 1
-rLabel.Text = "radius: " .. state.radius
+rLabel.Position = UDim2.fromOffset(8, 152); rLabel.Size = UDim2.new(1, -52, 0, 18)
+rLabel.BackgroundTransparency = 1; rLabel.Text = "radius: " .. state.radius
 rLabel.TextColor3 = Color3.fromRGB(255, 200, 80); rLabel.TextScaled = true
 rLabel.Font = Enum.Font.Code; rLabel.TextXAlignment = Enum.TextXAlignment.Left
 rLabel.Parent = frame
-
-mkBtn(frame, "−", UDim2.new(1, -46, 0, 122), UDim2.fromOffset(22, 18))
+mkBtn(frame, "−", UDim2.new(1, -46, 0, 152), UDim2.fromOffset(22, 18))
     .Activated:Connect(function()
         state.radius = math.max(5, state.radius - 5)
         rLabel.Text = "radius: " .. state.radius
     end)
-mkBtn(frame, "+", UDim2.new(1, -22, 0, 122), UDim2.fromOffset(22, 18))
+mkBtn(frame, "+", UDim2.new(1, -22, 0, 152), UDim2.fromOffset(22, 18))
     .Activated:Connect(function()
         state.radius = math.min(200, state.radius + 5)
         rLabel.Text = "radius: " .. state.radius
     end)
 
 local stats = Instance.new("TextLabel")
-stats.Position = UDim2.fromOffset(8, 148); stats.Size = UDim2.new(1, -16, 0, 16)
+stats.Position = UDim2.fromOffset(8, 176); stats.Size = UDim2.new(1, -16, 0, 16)
 stats.BackgroundTransparency = 1
-stats.Text = "deleted: 0"; stats.TextColor3 = Color3.fromRGB(150, 255, 180)
-stats.TextScaled = true; stats.Font = Enum.Font.Code; stats.Parent = frame
+stats.Text = "deleted: 0 · hits: 0 · learned: 0"
+stats.TextColor3 = Color3.fromRGB(150, 255, 180)
+stats.TextScaled = true; stats.Font = Enum.Font.Code
+stats.TextXAlignment = Enum.TextXAlignment.Left; stats.Parent = frame
 
 local lastLbl = Instance.new("TextLabel")
-lastLbl.Position = UDim2.fromOffset(8, 166); lastLbl.Size = UDim2.new(1, -16, 0, 16)
+lastLbl.Position = UDim2.fromOffset(8, 194); lastLbl.Size = UDim2.new(1, -16, 0, 16)
 lastLbl.BackgroundTransparency = 1
-lastLbl.Text = "last: —"; lastLbl.TextColor3 = Color3.fromRGB(255, 200, 80)
-lastLbl.TextScaled = true; lastLbl.Font = Enum.Font.Code; lastLbl.Parent = frame
+lastLbl.Text = "last del: — · last hit: —"
+lastLbl.TextColor3 = Color3.fromRGB(255, 200, 80)
+lastLbl.TextScaled = true; lastLbl.Font = Enum.Font.Code
+lastLbl.TextXAlignment = Enum.TextXAlignment.Left; lastLbl.Parent = frame
+
+-- learned list
+local learnedTitle = Instance.new("TextLabel")
+learnedTitle.Position = UDim2.fromOffset(8, 218); learnedTitle.Size = UDim2.new(1, -16, 0, 14)
+learnedTitle.BackgroundTransparency = 1
+learnedTitle.Text = "— LEARNED PATTERNS —"
+learnedTitle.TextColor3 = Color3.fromRGB(255, 100, 130)
+learnedTitle.TextScaled = true; learnedTitle.Font = Enum.Font.GothamBold
+learnedTitle.Parent = frame
+
+local learnedFrame = Instance.new("ScrollingFrame")
+learnedFrame.Position = UDim2.fromOffset(8, 234); learnedFrame.Size = UDim2.new(1, -16, 0, 100)
+learnedFrame.BackgroundColor3 = Color3.fromRGB(28, 28, 37)
+learnedFrame.BorderSizePixel = 0; learnedFrame.ScrollBarThickness = 2
+learnedFrame.CanvasSize = UDim2.new(); learnedFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+learnedFrame.Parent = frame
+do
+    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 4); c.Parent = learnedFrame
+    local l = Instance.new("UIListLayout"); l.Padding = UDim.new(0, 1); l.Parent = learnedFrame
+    local p = Instance.new("UIPadding"); p.PaddingTop = UDim.new(0, 2)
+    p.PaddingLeft = UDim.new(0, 2); p.PaddingRight = UDim.new(0, 2); p.Parent = learnedFrame
+end
+
+local function refreshLearned()
+    for _, c in ipairs(learnedFrame:GetChildren()) do
+        if c:IsA("TextLabel") then c:Destroy() end
+    end
+    local list = {}
+    for key, l in pairs(learned) do
+        list[#list + 1] = { key = key, l = l }
+    end
+    table.sort(list, function(a, b) return a.l.conf > b.l.conf end)
+    for i = 1, math.min(#list, 30) do
+        local l = list[i].l
+        local lb = Instance.new("TextLabel")
+        lb.Size = UDim2.new(1, -2, 0, 14); lb.BackgroundTransparency = 1
+        lb.Text = string.format("%s · %s · conf=%d", l.name, l.class, l.conf)
+        lb.TextColor3 = l.conf >= 2
+            and Color3.fromRGB(255, 130, 130) or Color3.fromRGB(180, 200, 230)
+        lb.TextSize = 9; lb.Font = Enum.Font.Code
+        lb.TextXAlignment = Enum.TextXAlignment.Left
+        lb.TextTruncate = Enum.TextTruncate.AtEnd
+        lb.Parent = learnedFrame
+    end
+    if #list == 0 then
+        local lb = Instance.new("TextLabel")
+        lb.Size = UDim2.new(1, -2, 0, 14); lb.BackgroundTransparency = 1
+        lb.Text = "· пусто — получи урон, паттерны появятся"
+        lb.TextColor3 = Color3.fromRGB(150, 150, 170)
+        lb.TextSize = 9; lb.Parent = learnedFrame
+    end
+end
 
 local info = Instance.new("TextLabel")
-info.Position = UDim2.fromOffset(8, 190); info.Size = UDim2.new(1, -16, 0, 130)
+info.Position = UDim2.fromOffset(8, 340); info.Size = UDim2.new(1, -16, 0, 82)
 info.BackgroundTransparency = 1; info.TextXAlignment = Enum.TextXAlignment.Left
 info.TextYAlignment = Enum.TextYAlignment.Top
 info.TextColor3 = Color3.fromRGB(200, 200, 220); info.TextSize = 9
 info.Font = Enum.Font.Gotham; info.TextWrapped = true; info.Parent = frame
-info.Text = "AUTO DELETE — удаляет опасные парты в радиусе (по имени, тегу, fx, скорости).\n\nCLICK DELETE — ЛКМ удаляет любой парт по клику. тест-мод.\n\nPROTECT — ПКМ помечает парт синим, auto-delete его не тронет.\n\nВсё локально. Сервер не затронут. Если игра считает попадание на сервере — урон всё равно придёт."
+info.Text = "LEARN: при падении HP снимается снапшот партов в радиусе 90. Что двигается, близко, мелкое, с тегом/именем-атакой → +confidence. С conf≥2 авто-удаляется даже вне обычных критериев. БОСС/npc/большой HP/большая часть — не трогается."
 
 RunService.Heartbeat:Connect(function()
-    stats.Text = "deleted: " .. state._deleted
-    lastLbl.Text = "last: " .. state._lastDel
+    stats.Text = string.format("deleted: %d · hits: %d · learned: %d",
+        state._deleted, state._hits, state._learnedN)
+    lastLbl.Text = string.format("last del: %s · last hit: %s",
+        state._lastDel, state._lastHitName)
 end)
 
-print("[worm shadow] delete tool loaded.")
+task.spawn(function()
+    while true do
+        task.wait(1)
+        refreshLearned()
+    end
+end)
+
+print("[worm shadow] delete+learn tool loaded.")
